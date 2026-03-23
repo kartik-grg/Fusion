@@ -60,6 +60,7 @@ celerybeat-schedule
 
 # virtualenv: ignore environment folder ending with env. e.g. env, venv, myenv, fusionenv, etc
 *env/
+venv38
 
 # Rope project settings
 .ropeproject
