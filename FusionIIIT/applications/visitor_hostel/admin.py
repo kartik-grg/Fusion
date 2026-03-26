@@ -6,6 +6,7 @@ from .models import (
     Building,
     GuestFeedback,
     Inventory,
+    InventoryReplenishmentRequest,
     InventoryUsage,
     MealBooking,
     Notification,
@@ -99,6 +100,21 @@ class InventoryUsageAdmin(admin.ModelAdmin):
     list_display = ("inventory_item", "booking", "quantity_used", "recorded_at", "recorded_by")
     search_fields = ("booking__booking_number", "inventory_item__name")
     date_hierarchy = "recorded_at"
+
+
+@admin.register(InventoryReplenishmentRequest)
+class InventoryReplenishmentRequestAdmin(admin.ModelAdmin):
+    list_display = (
+        "inventory_item",
+        "quantity_requested",
+        "status",
+        "requested_by",
+        "reviewed_by",
+        "created_at",
+    )
+    list_filter = ("status",)
+    search_fields = ("inventory_item__name", "requested_by__user__username")
+    date_hierarchy = "created_at"
 
 
 @admin.register(Notification)

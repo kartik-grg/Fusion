@@ -24,6 +24,8 @@ from .views import (
     GuestFeedbackView,
     InventoryAddView,
     InventoryListView,
+    InventoryReplenishmentRequestView,
+    InventoryReplenishmentReviewView,
     InventoryUpdateView,
     LowStockView,
     MealBookingView,
@@ -125,6 +127,20 @@ urlpatterns = [
 
     # PATCH /api/visitorhostel/inventory/update/  (VH-UC-011)
     path("inventory/update/", InventoryUpdateView.as_view(), name="inventory-update"),
+
+    # GET,POST /api/visitorhostel/inventory/replenishment-requests/
+    path(
+        "inventory/replenishment-requests/",
+        InventoryReplenishmentRequestView.as_view(),
+        name="inventory-replenishment-requests",
+    ),
+
+    # POST /api/visitorhostel/inventory/replenishment-requests/review/
+    path(
+        "inventory/replenishment-requests/review/",
+        InventoryReplenishmentReviewView.as_view(),
+        name="inventory-replenishment-review",
+    ),
 
     # GET  /api/visitorhostel/inventory/low-stock/  (BR-VH-007 alert)
     path("inventory/low-stock/", LowStockView.as_view(), name="inventory-low-stock"),

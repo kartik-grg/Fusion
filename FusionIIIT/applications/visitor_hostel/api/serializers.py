@@ -15,6 +15,7 @@ from ..models import (
     Building,
     GuestFeedback,
     Inventory,
+    InventoryReplenishmentRequest,
     InventoryCategory,
     MealBooking,
     Notification,
@@ -403,6 +404,55 @@ class InventoryUpdateSerializer(serializers.Serializer):
     quantity_delta = serializers.IntegerField(
         help_text="Positive to add, negative to reduce."
     )
+
+
+class InventoryReplenishmentRequestSerializer(serializers.ModelSerializer):
+    inventory_item_name = serializers.CharField(source="inventory_item.name", read_only=True)
+    requested_by_name = serializers.CharField(source="requested_by.user.get_full_name", read_only=True, default="")
+    reviewed_by_name = serializers.CharField(source="reviewed_by.user.get_full_name", read_only=True, default="")
+
+    class Meta:
+        model = InventoryReplenishmentRequest
+        fields = [
+            "id",
+            "inventory_item",
+            "inventory_item_name",
+            "requested_by",
+            "requested_by_name",
+            "quantity_requested",
+            "reason",
+            "status",
+            "reviewed_by",
+            "reviewed_by_name",
+            "reviewed_at",
+            "review_remark",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "requested_by",
+            "status",
+            "reviewed_by",
+            "reviewed_at",
+            "created_at",
+            "updated_at",
+            "inventory_item_name",
+            "requested_by_name",
+            "reviewed_by_name",
+        ]
+
+
+class InventoryReplenishmentCreateSerializer(serializers.Serializer):
+    item_id = serializers.IntegerField()
+    quantity_requested = serializers.IntegerField(min_value=1)
+    reason = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class InventoryReplenishmentReviewSerializer(serializers.Serializer):
+    request_id = serializers.IntegerField()
+    approve = serializers.BooleanField()
+    review_remark = serializers.CharField(required=False, allow_blank=True, default="")
 
 
 # ──────────────────────────── Notification / Feedback ────────────────────────────

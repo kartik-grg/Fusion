@@ -23,6 +23,7 @@ from ..selectors import (
     get_all_notifications, get_available_rooms, get_bill_by_id,
     get_booking_by_id, get_bookings_by_intender, get_checked_in_bookings,
     get_dashboard_stats, get_forwarded_bookings, get_inventory_by_id,
+    get_inventory_replenishment_requests,
     get_low_stock_items, get_meals_for_booking, get_pending_bookings,
     get_unread_notifications,
     get_room_by_id, get_all_rooms,
@@ -34,7 +35,9 @@ from ..services import (
     expire_pending_bookings, forward_booking, generate_bill,
     generate_booking_report, mark_no_show, modify_booking, record_meal,
     reject_booking_by_caretaker, reject_booking_by_incharge,
+    request_inventory_replenishment,
     request_booking_cancellation, settle_bill, update_inventory_item,
+    review_inventory_replenishment_request,
 )
 from .serializers import (
     ApproveCancellationSerializer, BillSerializer,
@@ -43,6 +46,9 @@ from .serializers import (
     CancellationPreviewSerializer,
     CancelBookingSerializer, CheckInSerializer, CheckOutSerializer,
     ConfirmBookingSerializer, ForwardBookingSerializer, GuestFeedbackSerializer,
+    InventoryReplenishmentCreateSerializer,
+    InventoryReplenishmentRequestSerializer,
+    InventoryReplenishmentReviewSerializer,
     InventorySerializer, InventoryUpdateSerializer, MealBookingSerializer,
     NoShowSerializer, NotificationSerializer, RejectBookingSerializer, RoomAvailabilitySerializer,
     RoomDetailSerializer, SettleBillSerializer,
@@ -123,6 +129,24 @@ def _is_vh_caretaker(extrainfo: ExtraInfo) -> bool:
     ).values_list("designation__name", "designation__full_name")
     return any(
         "caretaker" in _normalize_role(name) or "caretaker" in _normalize_role(full_name)
+        for name, full_name in designation_names
+    )
+
+
+def _is_vh_incharge(extrainfo: ExtraInfo) -> bool:
+    role = _normalize_role(extrainfo.last_selected_role)
+    if role and "incharge" in role:
+        return True
+
+    group_names = extrainfo.user.groups.values_list("name", flat=True)
+    if any("incharge" in _normalize_role(name) for name in group_names):
+        return True
+
+    designation_names = HoldsDesignation.objects.filter(
+        working=extrainfo.user,
+    ).values_list("designation__name", "designation__full_name")
+    return any(
+        "incharge" in _normalize_role(name) or "incharge" in _normalize_role(full_name)
         for name, full_name in designation_names
     )
 
@@ -676,14 +700,113 @@ class InventoryUpdateView(APIView):
         d = serializer.validated_data
         item = get_object_or_404(Inventory, pk=d["item_id"])
         actor = _get_extrainfo(request)
+        delta = d["quantity_delta"]
+
+        if delta > 0 and _is_vh_caretaker(actor) and not _is_vh_incharge(actor):
+            try:
+                req = request_inventory_replenishment(
+                    item=item,
+                    quantity_requested=delta,
+                    requested_by=actor,
+                    reason=request.data.get("reason", ""),
+                )
+                return Response(
+                    {
+                        "message": "Replenishment request sent to VH Incharge for approval.",
+                        "request": InventoryReplenishmentRequestSerializer(req).data,
+                    },
+                    status=status.HTTP_202_ACCEPTED,
+                )
+            except VHError as e:
+                return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
         try:
-            updated = update_inventory_item(item, d["quantity_delta"], actor)
+            updated = update_inventory_item(item, delta, actor)
             if updated is None:
                 return Response(
                     {"message": "Inventory item deleted (quantity reached zero)."},
                     status=status.HTTP_200_OK,
                 )
             return Response(InventorySerializer(updated).data)
+        except VHError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class InventoryReplenishmentRequestView(APIView):
+    """Caretaker creates replenishment requests; staff can list requests."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        actor = _get_extrainfo(request)
+        status_filter = request.query_params.get("status")
+
+        if _is_vh_incharge(actor):
+            requests_qs = get_inventory_replenishment_requests(status=status_filter)
+        elif _is_vh_caretaker(actor):
+            requests_qs = get_inventory_replenishment_requests(
+                status=status_filter,
+                requested_by_id=actor.id,
+            )
+        else:
+            return Response(
+                {"error": "Only VH caretaker/incharge can view replenishment requests."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        return Response(InventoryReplenishmentRequestSerializer(requests_qs, many=True).data)
+
+    def post(self, request):
+        actor = _get_extrainfo(request)
+        if not _is_vh_caretaker(actor):
+            return Response(
+                {"error": "Only VH caretaker can create replenishment requests."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        serializer = InventoryReplenishmentCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        d = serializer.validated_data
+        item = get_object_or_404(Inventory, pk=d["item_id"])
+        try:
+            req = request_inventory_replenishment(
+                item=item,
+                quantity_requested=d["quantity_requested"],
+                requested_by=actor,
+                reason=d.get("reason", ""),
+            )
+            return Response(
+                InventoryReplenishmentRequestSerializer(req).data,
+                status=status.HTTP_201_CREATED,
+            )
+        except VHError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class InventoryReplenishmentReviewView(APIView):
+    """VH incharge approves or rejects a pending replenishment request."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        actor = _get_extrainfo(request)
+        if not _is_vh_incharge(actor):
+            return Response(
+                {"error": "Only VH Incharge can review replenishment requests."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        serializer = InventoryReplenishmentReviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        d = serializer.validated_data
+        request_obj = get_object_or_404(get_inventory_replenishment_requests(), pk=d["request_id"])
+
+        try:
+            reviewed = review_inventory_replenishment_request(
+                request_obj=request_obj,
+                reviewer=actor,
+                approve=d["approve"],
+                review_remark=d.get("review_remark", ""),
+            )
+            return Response(InventoryReplenishmentRequestSerializer(reviewed).data)
         except VHError as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 

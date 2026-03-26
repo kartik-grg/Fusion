@@ -14,6 +14,7 @@ from applications.globals.models import ExtraInfo
 
 from .models import (
     Bill, BillStatus, BookingDetail, BookingStatus, Inventory,
+    InventoryReplenishmentRequest, InventoryReplenishmentStatus,
     InventoryUsage, MealBooking, MealType, Notification, Payment,
     PaymentMode, RoomAllocation, RoomDetail, RoomStatus, VisitorDetail,
     VisitorCategory,
@@ -985,6 +986,57 @@ def update_inventory_item(
 
     item.save()
     return item
+
+
+@transaction.atomic
+def request_inventory_replenishment(
+    item: Inventory,
+    quantity_requested: int,
+    requested_by: ExtraInfo,
+    reason: str = "",
+) -> InventoryReplenishmentRequest:
+    """Create a pending inventory increment request for incharge review."""
+    if quantity_requested <= 0:
+        raise ValidationError("Requested quantity must be greater than zero.")
+
+    req = InventoryReplenishmentRequest.objects.create(
+        inventory_item=item,
+        requested_by=requested_by,
+        quantity_requested=quantity_requested,
+        reason=reason,
+        status=InventoryReplenishmentStatus.PENDING,
+    )
+    return req
+
+
+@transaction.atomic
+def review_inventory_replenishment_request(
+    request_obj: InventoryReplenishmentRequest,
+    reviewer: ExtraInfo,
+    approve: bool,
+    review_remark: str = "",
+) -> InventoryReplenishmentRequest:
+    """Approve or reject a pending inventory increment request."""
+    if request_obj.status != InventoryReplenishmentStatus.PENDING:
+        raise ValidationError("Only pending replenishment requests can be reviewed.")
+
+    request_obj.reviewed_by = reviewer
+    request_obj.reviewed_at = timezone.now()
+    request_obj.review_remark = review_remark
+
+    if approve:
+        item = request_obj.inventory_item
+        delta = request_obj.quantity_requested
+        item.quantity += delta
+        item.usable_quantity += delta
+        item.updated_by = reviewer
+        item.save()
+        request_obj.status = InventoryReplenishmentStatus.APPROVED
+    else:
+        request_obj.status = InventoryReplenishmentStatus.REJECTED
+
+    request_obj.save()
+    return request_obj
 
 
 # ──────────────────────────── UC-006: Room Availability ────────────────────────────

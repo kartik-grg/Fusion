@@ -12,6 +12,8 @@ from .models import (
     BookingDetail,
     BookingStatus,
     Inventory,
+    InventoryReplenishmentRequest,
+    InventoryReplenishmentStatus,
     MealBooking,
     Notification,
     RoomAllocation,
@@ -175,6 +177,31 @@ def get_low_stock_items():
     """BR-VH-007: Items below threshold."""
     from django.db.models import F
     return Inventory.objects.filter(quantity__lt=F("threshold_quantity"))
+
+
+def get_replenishment_request_by_id(request_id: int) -> InventoryReplenishmentRequest:
+    return InventoryReplenishmentRequest.objects.select_related(
+        "inventory_item",
+        "requested_by__user",
+        "reviewed_by__user",
+    ).get(pk=request_id)
+
+
+def get_inventory_replenishment_requests(status: str = None, requested_by_id: int = None):
+    qs = InventoryReplenishmentRequest.objects.select_related(
+        "inventory_item",
+        "requested_by__user",
+        "reviewed_by__user",
+    ).order_by("-created_at")
+    if status:
+        qs = qs.filter(status=status)
+    if requested_by_id:
+        qs = qs.filter(requested_by_id=requested_by_id)
+    return qs
+
+
+def get_pending_inventory_replenishment_requests():
+    return get_inventory_replenishment_requests(status=InventoryReplenishmentStatus.PENDING)
 
 
 # ──────────────────────────── Notifications ────────────────────────────

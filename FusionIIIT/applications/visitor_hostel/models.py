@@ -110,6 +110,13 @@ class InventoryCategory(models.TextChoices):
     ASSET = "Asset", "Asset / Reusable"
 
 
+class InventoryReplenishmentStatus(models.TextChoices):
+    """Status of caretaker-initiated inventory increment requests."""
+    PENDING = "Pending", "Pending"
+    APPROVED = "Approved", "Approved"
+    REJECTED = "Rejected", "Rejected"
+
+
 # ──────────────────────────── ROOM MANAGEMENT ────────────────────────────
 
 class Building(models.Model):
@@ -521,6 +528,46 @@ class Inventory(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.quantity} {self.unit})"
+
+
+class InventoryReplenishmentRequest(models.Model):
+    """
+    Inventory increment request raised by caretaker and decided by incharge.
+    Quantity updates are applied only when request is approved.
+    """
+    inventory_item = models.ForeignKey(
+        'visitor_hostel.Inventory', on_delete=models.CASCADE, related_name="replenishment_requests"
+    )
+    requested_by = models.ForeignKey(
+        ExtraInfo, on_delete=models.CASCADE, related_name="inventory_replenishment_requests"
+    )
+    quantity_requested = models.IntegerField(validators=[MinValueValidator(1)])
+    reason = models.CharField(max_length=300, blank=True)
+    status = models.CharField(
+        max_length=20,
+        choices=InventoryReplenishmentStatus.choices,
+        default=InventoryReplenishmentStatus.PENDING,
+    )
+    reviewed_by = models.ForeignKey(
+        ExtraInfo,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="inventory_replenishment_reviews",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    review_remark = models.CharField(max_length=300, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return (
+            f"{self.inventory_item.name}: +{self.quantity_requested} "
+            f"({self.status})"
+        )
 
 
 class InventoryUsage(models.Model):
