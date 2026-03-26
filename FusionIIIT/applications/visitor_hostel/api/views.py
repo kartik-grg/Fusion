@@ -12,7 +12,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from applications.globals.models import ExtraInfo
+from applications.globals.models import ExtraInfo, HoldsDesignation
 
 from ..models import (
     Bill, BookingDetail, GuestFeedback, Inventory, MealBooking,
@@ -28,16 +28,19 @@ from ..selectors import (
     get_room_by_id, get_all_rooms,
 )
 from ..services import (
-    VHError, add_inventory_item, cancel_booking, check_in,
-    check_out, check_room_availability, confirm_booking,
-    create_booking, expire_pending_bookings, forward_booking,
-    generate_bill, generate_booking_report, modify_booking,
-    record_meal, reject_booking_by_caretaker, reject_booking_by_incharge,
-    settle_bill, update_inventory_item,
+    VHError, add_inventory_item, approve_booking_cancellation_request,
+    check_in, check_out, check_room_availability,
+    compute_cancellation_charges, confirm_booking, create_booking,
+    expire_pending_bookings, forward_booking, generate_bill,
+    generate_booking_report, modify_booking, record_meal,
+    reject_booking_by_caretaker, reject_booking_by_incharge,
+    request_booking_cancellation, settle_bill, update_inventory_item,
 )
 from .serializers import (
-    BillSerializer, BookingCreateSerializer, BookingDetailSerializer,
+    ApproveCancellationSerializer, BillSerializer,
+    BookingCreateSerializer, BookingDetailSerializer,
     BookingListSerializer, BookingModifySerializer, BuildingSerializer,
+    CancellationPreviewSerializer,
     CancelBookingSerializer, CheckInSerializer, CheckOutSerializer,
     ConfirmBookingSerializer, ForwardBookingSerializer, GuestFeedbackSerializer,
     InventorySerializer, InventoryUpdateSerializer, MealBookingSerializer,
@@ -49,6 +52,79 @@ from .serializers import (
 def _get_extrainfo(request):
     """Helper: get ExtraInfo for authenticated user."""
     return get_object_or_404(ExtraInfo, user=request.user)
+
+
+def _normalize_role(role_value: str) -> str:
+    return (
+        str(role_value or "")
+        .strip()
+        .lower()
+        .replace("_", "")
+        .replace("-", "")
+        .replace(" ", "")
+    )
+
+
+def _matches_vh_staff_role(role_value: str) -> bool:
+    """Best-effort matcher for Visitor Hostel caretaker/incharge role strings."""
+    role = _normalize_role(role_value)
+    if not role:
+        return False
+
+    known_exact = {
+        "vhcaretaker",
+        "visitorhostelcaretaker",
+        "hostelcaretaker",
+        "caretaker",
+        "vhincharge",
+        "visitorhostelincharge",
+        "hostelincharge",
+        "incharge",
+    }
+    if role in known_exact:
+        return True
+
+    has_scope = any(token in role for token in ["visitorhostel", "guesthouse", "vh"])
+    has_position = any(token in role for token in ["caretaker", "incharge"])
+    return has_scope and has_position
+
+
+def _is_vh_staff(extrainfo: ExtraInfo) -> bool:
+    """Return True when user is acting as Visitor Hostel caretaker/incharge."""
+    if _matches_vh_staff_role(extrainfo.last_selected_role):
+        return True
+
+    # Fallback: detect from Django groups if active role is not persisted.
+    group_names = extrainfo.user.groups.values_list("name", flat=True)
+    if any(_matches_vh_staff_role(name) for name in group_names):
+        return True
+
+    # Fallback: detect from holds-designation naming conventions.
+    designation_names = HoldsDesignation.objects.filter(
+        working=extrainfo.user,
+    ).values_list("designation__name", "designation__full_name")
+    return any(
+        _matches_vh_staff_role(name) or _matches_vh_staff_role(full_name)
+        for name, full_name in designation_names
+    )
+
+
+def _is_vh_caretaker(extrainfo: ExtraInfo) -> bool:
+    role = _normalize_role(extrainfo.last_selected_role)
+    if role and "caretaker" in role:
+        return True
+
+    group_names = extrainfo.user.groups.values_list("name", flat=True)
+    if any("caretaker" in _normalize_role(name) for name in group_names):
+        return True
+
+    designation_names = HoldsDesignation.objects.filter(
+        working=extrainfo.user,
+    ).values_list("designation__name", "designation__full_name")
+    return any(
+        "caretaker" in _normalize_role(name) or "caretaker" in _normalize_role(full_name)
+        for name, full_name in designation_names
+    )
 
 
 # ──────────────────────────── Dashboard (VH-UC-016) ────────────────────────────
@@ -115,6 +191,11 @@ class BookingRequestView(APIView):
         serializer.is_valid(raise_exception=True)
         extrainfo = _get_extrainfo(request)
         d = serializer.validated_data
+        # Auto-detect if caretaker is creating booking and mark as offline
+        is_offline = d.get("is_offline", False)
+        if _is_vh_caretaker(extrainfo):
+            is_offline = True
+            
         try:
             booking = create_booking(
                 intender_extrainfo=extrainfo,
@@ -137,7 +218,76 @@ class BookingRequestView(APIView):
                 id_proof_number=d.get("id_proof_number", ""),
                 project_number=d.get("project_number", ""),
                 remark=d.get("remark", ""),
-                is_offline=d.get("is_offline", False),
+                is_offline=is_offline,
+            )
+            return Response(
+                BookingDetailSerializer(booking).data,
+                status=status.HTTP_201_CREATED,
+            )
+        except VHError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class CaretakerBookingCreateView(APIView):
+    """VH-UC-001 (CARETAKER): Create offline booking on behalf of intender.
+    VH-BR-010: Authorize caretaker actions
+    VH-BR-011: Authentication required
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        caretaker_extrainfo = _get_extrainfo(request)
+        # Verify caretaker role
+        if not _is_vh_caretaker(caretaker_extrainfo):
+            return Response(
+                {"error": "Only VH caretakers can create offline bookings."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        
+        serializer = BookingCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        d = serializer.validated_data
+        
+        # Get the intender from request data
+        intender_extrainfo_id = request.data.get("intender_id")
+        if not intender_extrainfo_id:
+            return Response(
+                {"error": "intender_id is required for caretaker booking creation."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        
+        try:
+            intender_extrainfo = ExtraInfo.objects.get(id=intender_extrainfo_id)
+        except ExtraInfo.DoesNotExist:
+            return Response(
+                {"error": "Specified intender not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        
+        try:
+            booking = create_booking(
+                intender_extrainfo=intender_extrainfo,
+                visitor_name=d["visitor_name"],
+                visitor_category=d["visitor_category"],
+                visitor_phone=d["visitor_phone"],
+                check_in_date=d["check_in_date"],
+                check_out_date=d["check_out_date"],
+                number_of_guests=d["number_of_guests"],
+                number_of_rooms=d["number_of_rooms"],
+                purpose=d["purpose"],
+                bill_to_be_settled_by=d["bill_to_be_settled_by"],
+                preferred_room_type=d.get("preferred_room_type", ""),
+                purpose_details=d.get("purpose_details", ""),
+                visitor_email=d.get("visitor_email", ""),
+                visitor_organization=d.get("visitor_organization", ""),
+                visitor_designation=d.get("visitor_designation", ""),
+                visitor_address=d.get("visitor_address", ""),
+                id_proof_type=d.get("id_proof_type", ""),
+                id_proof_number=d.get("id_proof_number", ""),
+                project_number=d.get("project_number", ""),
+                remark=d.get("remark", ""),
+                is_offline=True,  # Always mark as offline when created by caretaker
+                caretaker=caretaker_extrainfo,
             )
             return Response(
                 BookingDetailSerializer(booking).data,
@@ -153,6 +303,12 @@ class BookingDetailView(APIView):
 
     def get(self, request, booking_id):
         booking = get_object_or_404(BookingDetail, pk=booking_id)
+        extrainfo = _get_extrainfo(request)
+        if booking.intender_id != extrainfo.id and not _is_vh_staff(extrainfo):
+            return Response(
+                {"error": "You are not allowed to view this booking."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         return Response(BookingDetailSerializer(booking).data)
 
     def patch(self, request, booking_id):
@@ -250,7 +406,7 @@ class RejectByInchargeView(APIView):
 
 
 class CancelBookingView(APIView):
-    """VH-UC-005 / VH-UC-019 / VH-UC-020: Cancel booking — VH-BR-015 / VH-BR-016."""
+    """Intender submits cancellation request after reviewing charges."""
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
@@ -260,7 +416,43 @@ class CancelBookingView(APIView):
         booking = get_object_or_404(BookingDetail, pk=d["booking_id"])
         actor = _get_extrainfo(request)
         try:
-            updated = cancel_booking(booking, actor, d.get("reason", ""))
+            updated = request_booking_cancellation(booking, actor, d.get("reason", ""))
+            return Response(BookingDetailSerializer(updated).data)
+        except VHError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class CancellationPreviewView(APIView):
+    """Preview BR-VH-005 cancellation charges before creating request."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = CancellationPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        booking = get_object_or_404(BookingDetail, pk=serializer.validated_data["booking_id"])
+        actor = _get_extrainfo(request)
+        if booking.intender_id != actor.id:
+            return Response({"error": "Only the booking intender can preview cancellation charges."}, status=status.HTTP_403_FORBIDDEN)
+        try:
+            details = compute_cancellation_charges(booking)
+            return Response(details)
+        except VHError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ApproveCancellationView(APIView):
+    """Caretaker approves cancellation request and finalizes booking cancellation."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = ApproveCancellationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        booking = get_object_or_404(BookingDetail, pk=serializer.validated_data["booking_id"])
+        actor = _get_extrainfo(request)
+        if not _is_vh_caretaker(actor):
+            return Response({"error": "Only caretaker can approve cancellation requests."}, status=status.HTTP_403_FORBIDDEN)
+        try:
+            updated = approve_booking_cancellation_request(booking, actor)
             return Response(BookingDetailSerializer(updated).data)
         except VHError as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)

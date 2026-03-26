@@ -66,18 +66,24 @@ class MealDeadlineError(VHError):
 VALID_TRANSITIONS = {
     BookingStatus.PENDING: [
         BookingStatus.FORWARDED,
+        BookingStatus.CANCELLATION_REQUESTED,
         BookingStatus.CANCELLED,
         BookingStatus.REJECTED,
         BookingStatus.EXPIRED,
     ],
     BookingStatus.FORWARDED: [
         BookingStatus.CONFIRMED,
+        BookingStatus.CANCELLATION_REQUESTED,
         BookingStatus.REJECTED,
         BookingStatus.CANCELLED,
         BookingStatus.PENDING,  # returned after modification
     ],
     BookingStatus.CONFIRMED: [
+        BookingStatus.CANCELLATION_REQUESTED,
         BookingStatus.CHECKED_IN,
+        BookingStatus.CANCELLED,
+    ],
+    BookingStatus.CANCELLATION_REQUESTED: [
         BookingStatus.CANCELLED,
     ],
     BookingStatus.CHECKED_IN: [
@@ -253,22 +259,18 @@ def modify_booking(
     **kwargs,
 ) -> BookingDetail:
     """
-    UC-VH-017 / VH-UC-003: Modify pending or forwarded booking.
-    VH-BR-021: Allow booking modification by VH Staff
+    UC-VH-017 / VH-UC-003: Modify booking when it is pending.
+    VH-BR-021: Allow booking modification by booking intender
     VH-BR-042: Completed bookings immutable
-    VH-BR-005: Re-set status to Pending after modification
+    VH-BR-005: Booking remains Pending after modification
     """
-    if booking.status in [
-        BookingStatus.CONFIRMED,
-        BookingStatus.CHECKED_IN,
-        BookingStatus.CHECKED_OUT,
-        BookingStatus.CANCELLED,
-        BookingStatus.REJECTED,
-        BookingStatus.EXPIRED,
-    ]:
+    if booking.intender_id != modified_by.id:
+        raise PermissionDeniedError("Only the booking intender can modify this booking.")
+
+    if booking.status != BookingStatus.PENDING:
         raise InvalidStatusTransitionError(
-            "Cannot modify a booking that is confirmed, checked-in, or completed."
-        )  # VH-BR-042
+            "Only pending bookings can be modified."
+        )
 
     editable_fields = [
         "visitor_name", "visitor_phone", "visitor_email", "visitor_organization",
@@ -285,7 +287,7 @@ def modify_booking(
     if booking.check_in_date >= booking.check_out_date:
         raise ValidationError("Check-out date must be after check-in date.")
 
-    # VH-BR-005: re-route to pending after modification
+    # VH-BR-005: keep pending after modification
     booking.status = BookingStatus.PENDING
     booking.save()
 
@@ -427,6 +429,7 @@ def cancel_booking(
     booking: BookingDetail,
     cancelled_by: ExtraInfo,
     reason: str = "",
+    cancellation_charge: Decimal = Decimal("0"),
 ) -> BookingDetail:
     """
     VH-UC-005 / VH-UC-019 / VH-UC-020: Cancel booking.
@@ -438,6 +441,7 @@ def cancel_booking(
 
     booking.status = BookingStatus.CANCELLED
     booking.rejection_reason = reason
+    booking.cancellation_charge = max(Decimal(cancellation_charge or 0), Decimal("0"))
     booking.save()
 
     # VH-BR-015: Release allocated rooms
@@ -449,18 +453,19 @@ def cancel_booking(
 
     # VH-BR-016: Create zero-value bill if not already present
     if not hasattr(booking, "bill") or booking.bill is None:
+        total = max(Decimal(cancellation_charge or 0), Decimal("0"))
         Bill.objects.create(
             booking=booking,
             invoice_number=_generate_invoice_number(),
             invoice_date=date.today(),
             room_charges=Decimal("0"),
             meal_charges=Decimal("0"),
-            extra_charges=Decimal("0"),
+            extra_charges=total,
             discount=Decimal("0"),
-            total_amount=Decimal("0"),
+            total_amount=total,
             amount_paid=Decimal("0"),
-            balance_due=Decimal("0"),
-            status=BillStatus.CANCELLED,
+            balance_due=total,
+            status=BillStatus.GENERATED if total > 0 else BillStatus.CANCELLED,
             billed_to_name=booking.visitor_name,
             generated_by=cancelled_by,
         )
@@ -472,6 +477,106 @@ def cancel_booking(
         f"Booking {booking.booking_number} has been cancelled.",
     )
     return booking
+
+
+def _estimate_room_rent_for_cancellation(booking: BookingDetail) -> Decimal:
+    """Estimate room rent basis used for cancellation penalty calculation."""
+    if booking.room_allocations.exists():
+        return _calculate_room_charges(booking)
+
+    stay_days = max((booking.check_out_date - booking.check_in_date).days, 1)
+    candidate_rooms = RoomDetail.objects.filter(status=RoomStatus.AVAILABLE)
+    if booking.preferred_room_type:
+        candidate_rooms = candidate_rooms.filter(room_type=booking.preferred_room_type)
+
+    room = candidate_rooms.order_by("tariff_per_day").first() or RoomDetail.objects.order_by("tariff_per_day").first()
+    if room is None:
+        return Decimal("0")
+
+    daily_rate = _get_room_rate(room, booking.visitor_category)
+    return daily_rate * Decimal(booking.number_of_rooms) * Decimal(stay_days)
+
+
+def compute_cancellation_charges(booking: BookingDetail, cancellation_date: date = None) -> dict:
+    """BR-VH-005: Compute cancellation penalty based on arrival date proximity."""
+    if cancellation_date is None:
+        cancellation_date = date.today()
+
+    if booking.status in [
+        BookingStatus.CHECKED_IN,
+        BookingStatus.CHECKED_OUT,
+        BookingStatus.CANCELLED,
+        BookingStatus.REJECTED,
+        BookingStatus.EXPIRED,
+    ]:
+        raise InvalidStatusTransitionError("Cancellation request is not allowed for this booking status.")
+
+    room_rent = _estimate_room_rent_for_cancellation(booking)
+    days_to_arrival = (booking.check_in_date - cancellation_date).days
+
+    if days_to_arrival > 7:
+        penalty_percent = Decimal("0")
+    elif days_to_arrival > 0:
+        penalty_percent = Decimal("25")
+    else:
+        penalty_percent = Decimal("50")
+
+    cancellation_charge = (room_rent * penalty_percent / Decimal("100")).quantize(Decimal("0.01"))
+
+    return {
+        "room_rent": room_rent,
+        "penalty_percent": penalty_percent,
+        "days_to_arrival": days_to_arrival,
+        "cancellation_charge": cancellation_charge,
+    }
+
+
+@transaction.atomic
+def request_booking_cancellation(booking: BookingDetail, requested_by: ExtraInfo, reason: str = "") -> BookingDetail:
+    """Intender requests booking cancellation after reviewing computed charges."""
+    if booking.intender_id != requested_by.id:
+        raise PermissionDeniedError("Only the booking intender can request cancellation.")
+
+    if booking.status == BookingStatus.CANCELLATION_REQUESTED:
+        raise InvalidStatusTransitionError("Cancellation has already been requested for this booking.")
+
+    charges = compute_cancellation_charges(booking)
+
+    booking.status = BookingStatus.CANCELLATION_REQUESTED
+    booking.cancellation_reason = reason
+    booking.cancellation_charge = charges["cancellation_charge"]
+    booking.cancellation_requested_at = timezone.now()
+    booking.cancellation_requested_by = requested_by
+    booking.save()
+
+    _notify(
+        booking.intender.user.pk,
+        booking,
+        "Cancellation Request Submitted",
+        (
+            f"Cancellation request for booking {booking.booking_number} submitted. "
+            f"Estimated charge: Rs. {charges['cancellation_charge']}"
+        ),
+    )
+    return booking
+
+
+@transaction.atomic
+def approve_booking_cancellation_request(booking: BookingDetail, approved_by: ExtraInfo) -> BookingDetail:
+    """Caretaker approves cancellation request and finalizes booking cancellation."""
+    if booking.status != BookingStatus.CANCELLATION_REQUESTED:
+        raise InvalidStatusTransitionError("Only cancellation-requested bookings can be approved.")
+
+    booking.cancellation_approved_at = timezone.now()
+    booking.cancellation_approved_by = approved_by
+    booking.save(update_fields=["cancellation_approved_at", "cancellation_approved_by", "updated_at"])
+
+    return cancel_booking(
+        booking=booking,
+        cancelled_by=approved_by,
+        reason=booking.cancellation_reason or "Cancellation approved by caretaker.",
+        cancellation_charge=booking.cancellation_charge,
+    )
 
 
 # ──────────────────────────── UC-007: Check-in ────────────────────────────

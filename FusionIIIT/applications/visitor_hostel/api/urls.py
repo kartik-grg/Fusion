@@ -11,6 +11,8 @@ from .views import (
     BookingDetailView,
     BookingRequestView,
     CancelBookingView,
+    CancellationPreviewView,
+    CaretakerBookingCreateView,
     CheckInView,
     CheckOutView,
     ConfirmBookingView,
@@ -25,6 +27,7 @@ from .views import (
     LowStockView,
     MealBookingView,
     NotificationView,
+    ApproveCancellationView,
     RejectByCaretakerView,
     RejectByInchargeView,
     ReportView,
@@ -51,6 +54,9 @@ urlpatterns = [
     # POST /api/visitorhostel/bookings/         (VH-UC-001: request booking)
     path("bookings/", BookingRequestView.as_view(), name="booking-list-create"),
 
+    # POST /api/visitorhostel/bookings/create-offline/  (VH-UC-001: caretaker creates offline booking)
+    path("bookings/create-offline/", CaretakerBookingCreateView.as_view(), name="booking-create-offline"),
+
     # GET   /api/visitorhostel/bookings/all/    (caretaker / incharge view all)
     path("bookings/all/", AllBookingsView.as_view(), name="booking-all"),
 
@@ -72,6 +78,12 @@ urlpatterns = [
 
     # POST /api/visitorhostel/bookings/cancel/    (VH-UC-005/019/020)
     path("bookings/cancel/", CancelBookingView.as_view(), name="booking-cancel"),
+
+    # POST /api/visitorhostel/bookings/cancel/preview/    (BR-VH-005)
+    path("bookings/cancel/preview/", CancellationPreviewView.as_view(), name="booking-cancel-preview"),
+
+    # POST /api/visitorhostel/bookings/cancel/approve/    (caretaker approval)
+    path("bookings/cancel/approve/", ApproveCancellationView.as_view(), name="booking-cancel-approve"),
 
     # POST /api/visitorhostel/bookings/check-in/   (VH-UC-007)
     path("bookings/check-in/", CheckInView.as_view(), name="booking-checkin"),

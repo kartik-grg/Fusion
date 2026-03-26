@@ -199,6 +199,7 @@ class BookingListSerializer(serializers.ModelSerializer):
             "visitor_name", "visitor_category", "visitor_phone", "visitor_email",
             "check_in_date", "check_out_date", "number_of_guests", "number_of_rooms",
             "purpose", "status", "booking_date", "is_offline",
+            "cancellation_charge", "cancellation_requested_at",
         ]
 
 
@@ -250,6 +251,14 @@ class CancelBookingSerializer(serializers.Serializer):
     """VH-UC-005 / VH-UC-019 / VH-UC-020"""
     booking_id = serializers.IntegerField()
     reason = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class CancellationPreviewSerializer(serializers.Serializer):
+    booking_id = serializers.IntegerField()
+
+
+class ApproveCancellationSerializer(serializers.Serializer):
+    booking_id = serializers.IntegerField()
 
 
 class CheckInSerializer(serializers.Serializer):

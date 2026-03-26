@@ -17,6 +17,7 @@ class BookingStatus(models.TextChoices):
     PENDING = "Pending", "Pending"
     FORWARDED = "Forwarded", "Forwarded"
     CONFIRMED = "Confirmed", "Confirmed"
+    CANCELLATION_REQUESTED = "CancellationRequested", "Cancellation Requested"
     CHECKED_IN = "CheckedIn", "Checked In"
     CHECKED_OUT = "CheckedOut", "Checked Out"
     CANCELLED = "Cancelled", "Cancelled"
@@ -229,7 +230,7 @@ class BookingDetail(models.Model):
 
     # Booking metadata
     status = models.CharField(
-        max_length=20, choices=BookingStatus.choices, default=BookingStatus.PENDING
+        max_length=30, choices=BookingStatus.choices, default=BookingStatus.PENDING
     )  # VH-BR-005, VH-BR-038
     booking_date = models.DateTimeField(auto_now_add=True)  # VH-BR-033
     remark = models.CharField(max_length=500, blank=True)  # VH-BR-034
@@ -258,6 +259,20 @@ class BookingDetail(models.Model):
         HoldsDesignation, on_delete=models.SET_NULL, null=True, blank=True, related_name="vh_approval_holder"
     )
     rejection_reason = models.TextField(blank=True)
+
+    # Cancellation workflow metadata
+    cancellation_reason = models.TextField(blank=True)
+    cancellation_charge = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    cancellation_requested_at = models.DateTimeField(null=True, blank=True)
+    cancellation_requested_by = models.ForeignKey(
+        ExtraInfo, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="cancellation_requested_bookings"
+    )
+    cancellation_approved_at = models.DateTimeField(null=True, blank=True)
+    cancellation_approved_by = models.ForeignKey(
+        ExtraInfo, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="cancellation_approved_bookings"
+    )
 
     # Actual check-in/out timestamps
     actual_check_in = models.DateTimeField(null=True, blank=True)

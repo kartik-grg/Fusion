@@ -353,6 +353,8 @@ class ModifyBookingServiceTest(TestCase):
     def setUp(self):
         self.user = make_user("modifyuser")
         self.ei = make_extrainfo(self.user)
+        self.other_user = make_user("modifyuser2")
+        self.other_ei = make_extrainfo(self.other_user)
 
     def test_modify_pending_booking(self):
         """VH-BR-021"""
@@ -370,6 +372,16 @@ class ModifyBookingServiceTest(TestCase):
         booking = make_booking(self.ei, status=BookingStatus.CONFIRMED)
         with self.assertRaises(InvalidStatusTransitionError):
             modify_booking(booking, self.ei, visitor_name="X")
+
+    def test_cannot_modify_forwarded_booking(self):
+        booking = make_booking(self.ei, status=BookingStatus.FORWARDED)
+        with self.assertRaises(InvalidStatusTransitionError):
+            modify_booking(booking, self.ei, visitor_name="X")
+
+    def test_non_intender_cannot_modify(self):
+        booking = make_booking(self.ei)
+        with self.assertRaises(VHError):
+            modify_booking(booking, self.other_ei, visitor_name="X")
 
 
 class CheckInServiceTest(TestCase):
@@ -649,6 +661,8 @@ class BookingAPITest(APITestCase):
         self.client.force_authenticate(user=self.user)
         self.building = make_building("API")
         self.room = make_room(self.building, "601")
+        self.other_user = make_user("apiother")
+        self.other_ei = make_extrainfo(self.other_user)
 
     def test_get_dashboard(self):
         """VH-UC-016"""
@@ -723,11 +737,41 @@ class BookingAPITest(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
     def test_cancel_booking_api(self):
-        """VH-UC-005"""
+        """VH-UC-005: intender requests cancellation"""
         booking = make_booking(self.ei)
         response = self.client.post(
             "/api/visitorhostel/bookings/cancel/",
             {"booking_id": booking.pk, "reason": "Test cancel"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["status"], BookingStatus.CANCELLATION_REQUESTED)
+
+    def test_cancel_preview_api(self):
+        booking = make_booking(self.ei)
+        response = self.client.post(
+            "/api/visitorhostel/bookings/cancel/preview/",
+            {"booking_id": booking.pk},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("cancellation_charge", response.data)
+        self.assertIn("penalty_percent", response.data)
+
+    def test_caretaker_approves_cancellation_request(self):
+        booking = make_booking(self.ei)
+        self.client.post(
+            "/api/visitorhostel/bookings/cancel/",
+            {"booking_id": booking.pk, "reason": "Need to cancel"},
+            format="json",
+        )
+
+        self.other_ei.last_selected_role = "VhCaretaker"
+        self.other_ei.save(update_fields=["last_selected_role"])
+        self.client.force_authenticate(user=self.other_user)
+        response = self.client.post(
+            "/api/visitorhostel/bookings/cancel/approve/",
+            {"booking_id": booking.pk},
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -751,3 +795,33 @@ class BookingAPITest(APITestCase):
         response = self.client.get(f"/api/visitorhostel/reports/?start_date={start}&end_date={end}")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn("total_bookings", response.data)
+
+    def test_booking_detail_visible_to_intender(self):
+        booking = make_booking(self.ei)
+        response = self.client.get(f"/api/visitorhostel/bookings/{booking.pk}/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["id"], booking.pk)
+
+    def test_booking_detail_hidden_from_other_intender(self):
+        booking = make_booking(self.ei)
+        self.client.force_authenticate(user=self.other_user)
+        response = self.client.get(f"/api/visitorhostel/bookings/{booking.pk}/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_booking_detail_visible_to_vh_caretaker(self):
+        booking = make_booking(self.ei)
+        self.other_ei.last_selected_role = "VhCaretaker"
+        self.other_ei.save(update_fields=["last_selected_role"])
+        self.client.force_authenticate(user=self.other_user)
+        response = self.client.get(f"/api/visitorhostel/bookings/{booking.pk}/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["id"], booking.pk)
+
+    def test_booking_detail_visible_to_plain_incharge_role(self):
+        booking = make_booking(self.ei)
+        self.other_ei.last_selected_role = "incharge"
+        self.other_ei.save(update_fields=["last_selected_role"])
+        self.client.force_authenticate(user=self.other_user)
+        response = self.client.get(f"/api/visitorhostel/bookings/{booking.pk}/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["id"], booking.pk)
