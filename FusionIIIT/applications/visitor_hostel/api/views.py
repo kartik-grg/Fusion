@@ -32,7 +32,7 @@ from ..services import (
     check_in, check_out, check_room_availability,
     compute_cancellation_charges, confirm_booking, create_booking,
     expire_pending_bookings, forward_booking, generate_bill,
-    generate_booking_report, modify_booking, record_meal,
+    generate_booking_report, mark_no_show, modify_booking, record_meal,
     reject_booking_by_caretaker, reject_booking_by_incharge,
     request_booking_cancellation, settle_bill, update_inventory_item,
 )
@@ -44,7 +44,7 @@ from .serializers import (
     CancelBookingSerializer, CheckInSerializer, CheckOutSerializer,
     ConfirmBookingSerializer, ForwardBookingSerializer, GuestFeedbackSerializer,
     InventorySerializer, InventoryUpdateSerializer, MealBookingSerializer,
-    NotificationSerializer, RejectBookingSerializer, RoomAvailabilitySerializer,
+    NoShowSerializer, NotificationSerializer, RejectBookingSerializer, RoomAvailabilitySerializer,
     RoomDetailSerializer, SettleBillSerializer,
 )
 
@@ -475,8 +475,26 @@ class CheckInView(APIView):
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
+class NoShowView(APIView):
+    """VH-UC-007 Alternate Flow A1: caretaker marks a confirmed booking as no-show."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = NoShowSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        booking = get_object_or_404(BookingDetail, pk=serializer.validated_data["booking_id"])
+        caretaker = _get_extrainfo(request)
+        if not _is_vh_caretaker(caretaker):
+            return Response({"error": "Only caretaker can mark no-show."}, status=status.HTTP_403_FORBIDDEN)
+        try:
+            updated = mark_no_show(booking, caretaker)
+            return Response(BookingDetailSerializer(updated).data)
+        except VHError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
 class CheckOutView(APIView):
-    """VH-UC-008: Check-out + billing — VH-BR-001/002/003/018."""
+    """VH-UC-008: Check-out + billing with overstay handling — VH-BR-001/002/003/018."""
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
@@ -490,6 +508,8 @@ class CheckOutView(APIView):
                 booking=booking,
                 caretaker=caretaker,
                 extra_charges=d.get("extra_charges", Decimal("0")),
+                overstay_hours=d.get("overstay_hours", 0),
+                overstay_charges=d.get("overstay_charges", Decimal("0")),
                 discount=d.get("discount", Decimal("0")),
                 inventory_usage=d.get("inventory_usage", []),
             )
@@ -506,7 +526,17 @@ class BillListView(APIView):
 
     def get(self, request):
         status_filter = request.query_params.get("status")
-        bills = get_all_bills(status_filter)
+        extrainfo = _get_extrainfo(request)
+
+        if _is_vh_staff(extrainfo):
+            bills = get_all_bills(status_filter)
+        else:
+            bills = Bill.objects.select_related("booking__intender__user").filter(
+                booking__intender=extrainfo,
+            ).order_by("-created_at")
+            if status_filter:
+                bills = bills.filter(status=status_filter)
+
         return Response(BillSerializer(bills, many=True).data)
 
 
@@ -546,6 +576,8 @@ class SettleBillView(APIView):
         d = serializer.validated_data
         bill = get_object_or_404(Bill, pk=d["bill_id"])
         actor = _get_extrainfo(request)
+        if not _is_vh_caretaker(actor):
+            return Response({"error": "Only caretaker can settle bills."}, status=status.HTTP_403_FORBIDDEN)
         try:
             updated = settle_bill(
                 bill=bill,

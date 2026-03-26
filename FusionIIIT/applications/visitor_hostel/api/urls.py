@@ -14,6 +14,7 @@ from .views import (
     CancellationPreviewView,
     CaretakerBookingCreateView,
     CheckInView,
+    NoShowView,
     CheckOutView,
     ConfirmBookingView,
     DashboardView,
@@ -87,6 +88,9 @@ urlpatterns = [
 
     # POST /api/visitorhostel/bookings/check-in/   (VH-UC-007)
     path("bookings/check-in/", CheckInView.as_view(), name="booking-checkin"),
+
+    # POST /api/visitorhostel/bookings/no-show/   (VH-UC-007 alternate flow)
+    path("bookings/no-show/", NoShowView.as_view(), name="booking-no-show"),
 
     # POST /api/visitorhostel/bookings/check-out/  (VH-UC-008)
     path("bookings/check-out/", CheckOutView.as_view(), name="booking-checkout"),

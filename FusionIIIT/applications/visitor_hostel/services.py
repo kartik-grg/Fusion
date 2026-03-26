@@ -81,6 +81,7 @@ VALID_TRANSITIONS = {
     BookingStatus.CONFIRMED: [
         BookingStatus.CANCELLATION_REQUESTED,
         BookingStatus.CHECKED_IN,
+        BookingStatus.NO_SHOW,
         BookingStatus.CANCELLED,
     ],
     BookingStatus.CANCELLATION_REQUESTED: [
@@ -90,6 +91,7 @@ VALID_TRANSITIONS = {
         BookingStatus.CHECKED_OUT,
     ],
     BookingStatus.CHECKED_OUT: [],     # terminal
+    BookingStatus.NO_SHOW: [],         # terminal
     BookingStatus.CANCELLED: [],       # terminal
     BookingStatus.REJECTED: [],        # terminal
     BookingStatus.EXPIRED: [],         # terminal
@@ -324,6 +326,57 @@ def forward_booking(booking: BookingDetail, caretaker: ExtraInfo) -> BookingDeta
 
 
 @transaction.atomic
+def mark_no_show(
+    booking: BookingDetail,
+    caretaker: ExtraInfo,
+) -> BookingDetail:
+    """
+    VH-UC-007 Alternate Flow A1: Mark booking as No Show.
+    No-show keeps bill applicability as per normal booking charges.
+    """
+    _validate_transition(booking.status, BookingStatus.NO_SHOW)
+
+    if hasattr(booking, "bill"):
+        raise BillingLockedError("A bill already exists for this booking.")
+
+    room_charges = _calculate_room_charges(booking)
+    meal_charges = _calculate_meal_charges(booking)
+    total = room_charges + meal_charges
+
+    Bill.objects.create(
+        booking=booking,
+        invoice_number=_generate_invoice_number(),
+        invoice_date=date.today(),
+        room_charges=room_charges,
+        meal_charges=meal_charges,
+        extra_charges=Decimal("0"),
+        overstay_hours=0,
+        overstay_charges=Decimal("0"),
+        discount=Decimal("0"),
+        total_amount=max(total, Decimal("0")),
+        amount_paid=Decimal("0"),
+        balance_due=max(total, Decimal("0")),
+        status=BillStatus.GENERATED,
+        billed_to_name=booking.visitor_name,
+        generated_by=caretaker,
+    )
+
+    for allocation in booking.room_allocations.all():
+        room = allocation.room
+        room.status = RoomStatus.AVAILABLE
+        room.save()
+
+    booking.status = BookingStatus.NO_SHOW
+    booking.rejection_reason = "Marked as no-show by caretaker."
+    booking.save()
+
+    _notify(
+        booking.intender.user.pk,
+        booking,
+        "Booking Marked No Show",
+        f"Booking {booking.booking_number} has been marked as no-show. Applicable charges were billed.",
+    )
+    return booking
 def reject_booking_by_caretaker(
     booking: BookingDetail, caretaker: ExtraInfo, reason: str
 ) -> BookingDetail:
@@ -629,17 +682,20 @@ def check_out(
     booking: BookingDetail,
     caretaker: ExtraInfo,
     extra_charges: Decimal = Decimal("0"),
+    overstay_hours: int = 0,
+    overstay_charges: Decimal = Decimal("0"),
     discount: Decimal = Decimal("0"),
     inventory_usage: list = None,
 ) -> Bill:
     """
-    VH-UC-008: Check-out and generate bill.
+    VH-UC-008: Check-out and generate bill with overstay handling.
     VH-BR-001: Calculate room bill by visitor category
     VH-BR-002: Calculate meal bill
     VH-BR-003: Calculate total bill
     VH-BR-018: Update consumable inventory on checkout
     VH-BR-028: One bill per booking
     VH-BR-040: Lock bill after checkout
+    VH-UC-007: Handle overstay charges
     """
     _validate_transition(booking.status, BookingStatus.CHECKED_OUT)
 
@@ -657,8 +713,9 @@ def check_out(
     # VH-BR-002: Meal charges
     meal_charges = _calculate_meal_charges(booking)
 
-    # VH-BR-003: Total
-    total = room_charges + meal_charges + extra_charges - discount
+    # VH-BR-003: Treat overstay as part of extras for invoice display consistency.
+    combined_extra_charges = extra_charges + overstay_charges
+    total = room_charges + meal_charges + combined_extra_charges - discount
 
     # VH-BR-028: ensure single bill
     if hasattr(booking, "bill"):
@@ -670,7 +727,9 @@ def check_out(
         invoice_date=date.today(),
         room_charges=room_charges,
         meal_charges=meal_charges,
-        extra_charges=extra_charges,
+        extra_charges=combined_extra_charges,
+        overstay_hours=overstay_hours,
+        overstay_charges=overstay_charges,
         discount=discount,
         total_amount=max(total, Decimal("0")),
         amount_paid=Decimal("0"),

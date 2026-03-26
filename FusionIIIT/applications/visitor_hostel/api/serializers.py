@@ -267,10 +267,17 @@ class CheckInSerializer(serializers.Serializer):
     visitor_details = VisitorDetailSerializer(many=True, required=False, default=list)
 
 
+class NoShowSerializer(serializers.Serializer):
+    """VH-UC-007 Alternate Flow A1: Mark booking as no-show."""
+    booking_id = serializers.IntegerField()
+
+
 class CheckOutSerializer(serializers.Serializer):
-    """VH-UC-008: Check-out and billing"""
+    """VH-UC-008: Check-out and billing with overstay handling"""
     booking_id = serializers.IntegerField()
     extra_charges = serializers.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
+    overstay_hours = serializers.IntegerField(default=0, min_value=0)
+    overstay_charges = serializers.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
     discount = serializers.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
     inventory_usage = serializers.ListField(
         child=serializers.DictField(), required=False, default=list
@@ -280,6 +287,18 @@ class CheckOutSerializer(serializers.Serializer):
         """VH-BR-024"""
         if value < 0:
             raise serializers.ValidationError("Extra charges cannot be negative.")
+        return value
+
+    def validate_overstay_hours(self, value):
+        """Validate overstay hours"""
+        if value < 0:
+            raise serializers.ValidationError("Overstay hours cannot be negative.")
+        return value
+
+    def validate_overstay_charges(self, value):
+        """Validate overstay charges"""
+        if value < 0:
+            raise serializers.ValidationError("Overstay charges cannot be negative.")
         return value
 
     def validate_discount(self, value):

@@ -20,6 +20,7 @@ class BookingStatus(models.TextChoices):
     CANCELLATION_REQUESTED = "CancellationRequested", "Cancellation Requested"
     CHECKED_IN = "CheckedIn", "Checked In"
     CHECKED_OUT = "CheckedOut", "Checked Out"
+    NO_SHOW = "NoShow", "No Show"
     CANCELLED = "Cancelled", "Cancelled"
     REJECTED = "Rejected", "Rejected"
     EXPIRED = "Expired", "Expired"
@@ -363,6 +364,16 @@ class Bill(models.Model):
     extra_charges = models.DecimalField(
         max_digits=12, decimal_places=2, default=0,
         validators=[MinValueValidator(0)]
+    )
+    # Overstay handling — VH-UC-007
+    overstay_hours = models.IntegerField(
+        default=0, validators=[MinValueValidator(0)],
+        help_text="Number of hours guest stayed beyond checkout time"
+    )
+    overstay_charges = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+        validators=[MinValueValidator(0)],
+        help_text="Extra charges applicable for overstay period"
     )
     discount = models.DecimalField(
         max_digits=12, decimal_places=2, default=0,

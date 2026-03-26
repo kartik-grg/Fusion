@@ -445,6 +445,19 @@ class BillingServiceTest(TestCase):
         self.assertGreaterEqual(bill.room_charges, Decimal("0"))
         self.assertEqual(bill.total_amount, bill.room_charges + bill.meal_charges + bill.extra_charges - bill.discount)
 
+    def test_checkout_includes_overstay_in_extra_charges(self):
+        """VH-UC-008: Overstay amount should be reflected in extras on bill."""
+        booking = self._make_confirmed_booking()
+        bill = check_out(
+            booking,
+            self.ei,
+            extra_charges=Decimal("120"),
+            overstay_hours=3,
+            overstay_charges=Decimal("450"),
+        )
+        self.assertEqual(bill.extra_charges, Decimal("570"))
+        self.assertEqual(bill.total_amount, bill.room_charges + bill.meal_charges + Decimal("570") - bill.discount)
+
     def test_one_bill_per_booking(self):
         """VH-BR-028"""
         booking = self._make_confirmed_booking()
